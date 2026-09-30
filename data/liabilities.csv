@@ -1,0 +1,4 @@
+bloque,notional_mm_eur,duracion,peso
+depositos_core,600.0,4.5,0.6
+depositos_plazo,250.0,1.8,0.25
+financiacion_mayorista,150.0,0.6,0.15

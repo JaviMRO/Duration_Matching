@@ -1,0 +1,7 @@
+{
+  "n_instrumentos": 15,
+  "duracion_objetivo_pasivos_D_L": 3.24,
+  "duracion_actual_cartera_D_actual": 6.7133,
+  "gap_inicial_años": 3.4733,
+  "nota": "gap = D_actual - D_L. Positivo => activos mas sensibles a tipos que pasivos; el optimizador debera reducirlo hacia 0."
+}
