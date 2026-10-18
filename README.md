@@ -64,4 +64,4 @@ Para ver la presentación basta con abrir `presentacion_duration_matching.html` 
 
 ## Autores
 
-Javier Martín Rodríguez y Máximo.
+Javier Martín Rodríguez y Máximo Prosperi Reynoso.
