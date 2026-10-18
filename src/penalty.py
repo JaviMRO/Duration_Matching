@@ -14,7 +14,9 @@ Hessiana generalizada (P_mu es C^1 y cuadrática a trozos):
     H_mu(w) = H_f + mu (1 1^T + diag(a)),   a_i = 1 si w_i < 0 o w_i > u_i, 0 en otro caso.
 
 Bucle externo: mu = 1, 10, ..., 1e8, con warm start (cada subproblema arranca en la solución
-del anterior; el primero en w0). Solver interno: Newton con Armijo de optimizers.newton.
+del anterior; el primero en w0). Solver interno: Newton con Armijo (como optimizers.newton) con
+un criterio de parada adicional sobre el paso, ||Δw|| < 1e-14 (1 + ||w||), para los mu grandes en
+los que ||grad P_mu|| se estanca por redondeo por encima de la tolerancia.
 
 Estimaciones de multiplicadores KKT (comparando grad P_mu = 0 con la estacionariedad de la
 lagrangiana  grad f + nu 1 - lambda + eta = 0):
@@ -26,6 +28,7 @@ La solución penalizada es ligeramente infactible: la violación es O(multiplica
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -33,11 +36,12 @@ from scipy.optimize import minimize
 
 from lagrange import solve_kkt
 from objective import ALMProblem, load_problem
-from optimizers import newton
+from optimizers import OptResult, armijo_backtracking
 
 MUS = [10.0**k for k in range(9)]  # 1, 10, ..., 1e8
 INNER_TOL = 1e-10
 INNER_MAX_ITER = 200
+STEP_TOL = 1e-14    # parada adicional del interno: ||Δw|| < STEP_TOL (1 + ||w||)
 ACTIVE_TOL = 1e-6   # |w_i - límite| por debajo de esto => restricción de caja activa
 FEAS_TOL = 1e-6     # tolerancia de factibilidad en la verificación KKT
 
@@ -84,11 +88,47 @@ class PenaltyStep:
     budget: float
     cond: float
     f: float
+    step_stop: bool = False  # el interno paró por ||Δw|| < STEP_TOL (1 + ||w||)
 
 
 def max_violation(problem: ALMProblem, w: np.ndarray) -> float:
     """max( |1^T w - 1|, max_i(-w_i), max_i(w_i - u_i), 0 )."""
     return float(max(abs(w.sum() - 1.0), np.max(-w), np.max(w - problem.u_max), 0.0))
+
+
+def newton_step_stop(problem, w_init: np.ndarray, tol: float = INNER_TOL,
+                     max_iter: int = INNER_MAX_ITER) -> tuple[OptResult, bool]:
+    """
+    optimizers.newton con Armijo y un criterio de parada adicional: además de ||grad|| < tol,
+    para cuando el paso efectivo cumple ||Δw|| < STEP_TOL (1 + ||w||).
+    Devuelve (resultado, True si paró por el paso).
+    """
+    t0 = time.perf_counter()
+    w = np.asarray(w_init, dtype=float).copy()
+    fw, g = problem.f(w), problem.grad(w)
+    f_hist, gn_hist, step_hist = [fw], [float(np.linalg.norm(g))], []
+
+    k, step_stop = 0, False
+    while gn_hist[-1] >= tol and k < max_iter:
+        p = np.linalg.solve(problem.hess(w), -g)
+        alpha = armijo_backtracking(problem.f, problem.grad, w, fw, g, p)
+        dw = alpha * p
+        w = w + dw
+        fw, g = problem.f(w), problem.grad(w)
+        k += 1
+        f_hist.append(fw)
+        gn_hist.append(float(np.linalg.norm(g)))
+        step_hist.append(alpha)
+        if np.linalg.norm(dw) < STEP_TOL * (1.0 + np.linalg.norm(w)):
+            step_stop = gn_hist[-1] >= tol
+            break
+
+    res = OptResult(
+        method="Newton (Armijo)", w=w, f=fw, grad_norm=gn_hist[-1], n_iter=k,
+        converged=gn_hist[-1] < tol, time_s=time.perf_counter() - t0,
+        f_hist=f_hist, grad_norm_hist=gn_hist, step_hist=step_hist,
+    )
+    return res, step_stop
 
 
 def solve_penalty(problem: ALMProblem, mus: list[float] = MUS) -> list[PenaltyStep]:
@@ -97,14 +137,14 @@ def solve_penalty(problem: ALMProblem, mus: list[float] = MUS) -> list[PenaltySt
     w = problem.w0.copy()
     for mu in mus:
         pp = PenalizedProblem(problem, mu)
-        res = newton(pp, w, line_search=True, tol=INNER_TOL, max_iter=INNER_MAX_ITER)
+        res, step_stop = newton_step_stop(pp, w)
         w = res.w
         eig = np.linalg.eigvalsh(pp.hess(w))
         steps.append(PenaltyStep(
             mu=mu, w=w.copy(), n_inner=res.n_iter, converged=res.converged,
             grad_norm=res.grad_norm, max_violation=max_violation(problem, w),
             gap=problem.duration_gap(w), budget=float(w.sum()),
-            cond=float(eig[-1] / eig[0]), f=problem.f(w),
+            cond=float(eig[-1] / eig[0]), f=problem.f(w), step_stop=step_stop,
         ))
     return steps
 
@@ -158,10 +198,11 @@ def turnover(problem: ALMProblem, w: np.ndarray) -> float:
 
 def print_outer_table(steps: list[PenaltyStep]) -> None:
     """Una fila por valor de mu."""
-    print(f"  {'mu':>7}{'iter':>6}{'conv':>6}{'||grad P||':>12}{'viol. máx':>12}{'gap (años)':>13}"
+    print(f"  {'mu':>7}{'iter':>6}{'conv':>13}{'||grad P||':>12}{'viol. máx':>12}{'gap (años)':>13}"
           f"{'sum(w)':>15}{'kappa(H_mu)':>13}{'f(w)':>13}")
     for s in steps:
-        print(f"  {s.mu:>7.0e}{s.n_inner:>6}{'sí' if s.converged else 'NO':>6}{s.grad_norm:>12.2e}"
+        conv = "sí" if s.converged else ("conv (paso)" if s.step_stop else "NO")
+        print(f"  {s.mu:>7.0e}{s.n_inner:>6}{conv:>13}{s.grad_norm:>12.2e}"
               f"{s.max_violation:>12.2e}{s.gap:>+13.2e}{s.budget:>15.10f}{s.cond:>13.3e}{s.f:>13.8f}")
 
 
